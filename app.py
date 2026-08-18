@@ -1,6 +1,6 @@
 """
 Bot Google Form — prospection
-Envoi séquentiel, anti-doublon, historique JSON, garde-fous anti-blocage Google.
+Anti-doublon, historique, anti-blocage, liens « Modifier votre réponse ».
 """
 
 from __future__ import annotations
@@ -11,11 +11,11 @@ import re
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import streamlit as st
 
-# --- Config formulaire ---
 FORM_ID = "1FAIpQLSeu2db441waSJVxcePzPTBbmyHBdJUGRU7debGCJwD4rlZh7w"
 FORM_VIEW_URL = f"https://docs.google.com/forms/d/e/{FORM_ID}/viewform"
 FORM_RESPONSE_URL = f"https://docs.google.com/forms/d/e/{FORM_ID}/formResponse"
@@ -27,7 +27,6 @@ ENTRY_CLIENT = "entry.1166974658"
 HISTORY_FILE = Path(__file__).resolve().parent / "historique_envois.json"
 STATE_FILE = Path(__file__).resolve().parent / "bot_state.json"
 
-# --- Garde-fous (réduire risque de blocage Google) ---
 DEFAULT_DELAY_MIN = 22
 DEFAULT_DELAY_MAX = 38
 MAX_PER_HOUR = 40
@@ -45,6 +44,14 @@ USER_AGENTS = [
 ]
 
 PHONE_RE = re.compile(r"^(?:0|\+?225)?([0-9]{8,10})$")
+EDIT2_RE = re.compile(
+    r"(?:edit2=|/formResponse\?[^\"'\s]*edit2=)([A-Za-z0-9_\-\.]+)",
+    re.I,
+)
+EDIT_HREF_RE = re.compile(
+    r'href=["\'](https://docs\.google\.com/forms/[^"\']*edit2=[^"\']+)["\']',
+    re.I,
+)
 
 BLOCK_MARKERS = (
     "unusual traffic",
@@ -135,9 +142,6 @@ def count_recent_success(history: list[dict], hours: float | None = None, days: 
             continue
         if days is not None and now - ts > timedelta(days=days):
             continue
-        if hours is None and days is None:
-            n += 1
-            continue
         n += 1
     return n
 
@@ -149,6 +153,42 @@ def looks_blocked(response: requests.Response) -> bool:
     if response.status_code in (403, 429, 503):
         return True
     return False
+
+
+def extract_edit_link(response: requests.Response) -> tuple[str | None, str | None]:
+    """
+    Récupère le token edit2 et l’URL « Modifier votre réponse » depuis la page de confirmation.
+    Nécessite que le propriétaire du form ait activé « Modifier après envoi ».
+    """
+    text = response.text or ""
+    final_url = response.url or ""
+
+    # 1) URL de redirection
+    for candidate in (final_url,):
+        if "edit2=" in candidate:
+            qs = parse_qs(urlparse(candidate).query)
+            tok = (qs.get("edit2") or [None])[0]
+            if tok:
+                edit_url = f"{FORM_VIEW_URL}?edit2={tok}"
+                return tok, edit_url
+
+    # 2) Lien href dans le HTML
+    m = EDIT_HREF_RE.search(text)
+    if m:
+        href = m.group(1).replace("&amp;", "&")
+        qs = parse_qs(urlparse(href).query)
+        tok = (qs.get("edit2") or [None])[0]
+        if tok:
+            return tok, f"{FORM_VIEW_URL}?edit2={tok}"
+        return None, href
+
+    # 3) Token brut dans la page
+    m2 = EDIT2_RE.search(text)
+    if m2:
+        tok = m2.group(1)
+        return tok, f"{FORM_VIEW_URL}?edit2={tok}"
+
+    return None, None
 
 
 def build_session() -> requests.Session:
@@ -169,7 +209,6 @@ def build_session() -> requests.Session:
             "Cache-Control": "max-age=0",
         }
     )
-    # Warm-up : ouvrir le formulaire pour cookies / session réaliste
     try:
         session.get(FORM_VIEW_URL, timeout=30)
         time.sleep(random.uniform(1.2, 2.8))
@@ -183,19 +222,24 @@ def submit_form(
     commercial: str,
     client: str,
     prospection_date: str,
-) -> tuple[bool, str, bool]:
+    edit2: str | None = None,
+) -> tuple[bool, str, bool, str | None, str | None]:
     """
-    Returns (ok, detail, blocked)
+    Returns (ok, detail, blocked, edit2_token, edit_url)
+    Si edit2 est fourni → modification d’une réponse existante.
     """
     payload = {
         ENTRY_COMMERCIAL: commercial,
         ENTRY_DATE: prospection_date,
         ENTRY_CLIENT: client,
     }
+    if edit2:
+        payload["edit2"] = edit2
+
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://docs.google.com",
-        "Referer": FORM_VIEW_URL,
+        "Referer": f"{FORM_VIEW_URL}?edit2={edit2}" if edit2 else FORM_VIEW_URL,
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
@@ -210,12 +254,22 @@ def submit_form(
             allow_redirects=True,
         )
         if looks_blocked(r):
-            return False, f"Possible blocage Google (HTTP {r.status_code})", True
+            return False, f"Possible blocage Google (HTTP {r.status_code})", True, None, None
+
+        tok, edit_url = extract_edit_link(r)
+        if edit2 and not tok:
+            tok = edit2
+            edit_url = f"{FORM_VIEW_URL}?edit2={edit2}"
+
         if r.status_code in (200, 302):
-            return True, f"HTTP {r.status_code}", False
-        return False, f"HTTP {r.status_code}", r.status_code in (403, 429, 503)
+            # Page confirmation type « Merci d'avoir renseigné »
+            body = (r.text or "").lower()
+            if "merci" in body or "response" in body or tok or edit2:
+                return True, f"HTTP {r.status_code}", False, tok, edit_url
+            return True, f"HTTP {r.status_code}", False, tok, edit_url
+        return False, f"HTTP {r.status_code}", r.status_code in (403, 429, 503), None, None
     except requests.RequestException as e:
-        return False, str(e), False
+        return False, str(e), False, None, None
 
 
 def parse_client_list(text: str) -> list[str]:
@@ -230,14 +284,13 @@ def parse_client_list(text: str) -> list[str]:
     return out
 
 
-def sleep_interruptible(seconds: float, stop_flag_key: str = "stop_requested") -> bool:
-    """Sleep by 1s steps. Returns True if stop requested."""
+def sleep_interruptible(seconds: float) -> bool:
     end = time.time() + seconds
     while time.time() < end:
-        if st.session_state.get(stop_flag_key):
+        if st.session_state.get("stop_requested"):
             return True
         time.sleep(min(1.0, end - time.time()))
-    return bool(st.session_state.get(stop_flag_key))
+    return bool(st.session_state.get("stop_requested"))
 
 
 # --- UI ---
@@ -260,14 +313,14 @@ st.markdown(
 )
 
 st.title("📋 Bot Google Form")
-st.caption("Prospection · anti-doublon · délais aléatoires · limites horaires · anti-blocage")
+st.caption("Prospection · historique · Modifier votre réponse · anti-blocage")
 
 if "running" not in st.session_state:
     st.session_state.running = False
 if "stop_requested" not in st.session_state:
     st.session_state.stop_requested = False
-if "last_run_log" not in st.session_state:
-    st.session_state.last_run_log = []
+if "edit_row_idx" not in st.session_state:
+    st.session_state.edit_row_idx = None
 
 history = load_history()
 already = successful_client_numbers(history)
@@ -283,13 +336,16 @@ with st.sidebar:
     max_day = st.number_input("Max succès / jour", 10, 500, MAX_PER_DAY)
     st.markdown(
         """
-**Règles anti-blocage**
-- Session + cookies (ouverture du form avant POST)
+**Anti-blocage**
+- Session + cookies
 - User-Agent aléatoire
-- Délai **aléatoire** entre envois
-- Pause auto si erreurs / soupçon de blocage
-- Plafonds horaires et journaliers
-- Anti-doublon (jamais 2× le même client en succès)
+- Délai aléatoire
+- Quotas heure / jour
+- Pause si erreurs
+
+**Modifier une réponse**
+Le lien *Modifier votre réponse* n’existe que si le propriétaire du Google Form a coché  
+**« Autoriser la modification de la réponse après l’envoi »**.
         """
     )
     if bot_state.get("pause_until"):
@@ -304,13 +360,12 @@ with st.form("config_form", clear_on_submit=False):
     commercial_raw = st.text_input(
         "Numéro commercial",
         value="07",
-        help="Format 07XXXXXXXX",
         placeholder="0700000000",
     )
     clients_text = st.text_area(
         "Numéros clients (un par ligne)",
         height=180,
-        placeholder="0701111111\n0702222222\n0703333333",
+        placeholder="0701111111\n0702222222",
     )
     today_str = date.today().isoformat()
     st.info(f"📅 Date prospection (auto) : **{today_str}**")
@@ -324,39 +379,37 @@ with col_stop:
 with col_clear:
     if st.button("🗑 Vider l’historique local", use_container_width=True):
         save_history([])
+        st.session_state.edit_row_idx = None
         st.success("Historique vidé.")
         st.rerun()
 
-# Limites actuelles
 ok_hour = count_recent_success(history, hours=1)
 ok_day = count_recent_success(history, days=1)
 st.write(
-    f"Quota actuel — **heure :** {ok_hour}/{int(max_hour)} · **jour :** {ok_day}/{int(max_day)} · "
-    f"**clients déjà OK :** {len(already)}"
+    f"Quota — **heure :** {ok_hour}/{int(max_hour)} · **jour :** {ok_day}/{int(max_day)} · "
+    f"**clients OK :** {len(already)}"
 )
 
 if start:
-    # Pause globale ?
     if bot_state.get("pause_until"):
         try:
             until = datetime.fromisoformat(bot_state["pause_until"])
             if datetime.now() < until:
-                st.error(f"Bot en pause de sécurité jusqu’à {until.strftime('%H:%M:%S')}. Lever la pause dans la barre latérale si besoin.")
+                st.error(f"Bot en pause jusqu’à {until.strftime('%H:%M:%S')}.")
                 st.stop()
-            else:
-                bot_state["pause_until"] = None
-                bot_state["consec_errors"] = 0
-                save_state(bot_state)
+            bot_state["pause_until"] = None
+            bot_state["consec_errors"] = 0
+            save_state(bot_state)
         except ValueError:
             pass
 
     commercial = normalize_phone(commercial_raw)
     if not commercial:
-        st.error("Numéro commercial invalide (ex. 0708091011).")
+        st.error("Numéro commercial invalide.")
     else:
         clients = parse_client_list(clients_text)
         if not clients:
-            st.error("Aucun numéro client valide dans la liste.")
+            st.error("Aucun numéro client valide.")
         else:
             to_send = [c for c in clients if c not in already]
             skipped = [c for c in clients if c in already]
@@ -368,41 +421,41 @@ if start:
 
             st.write(f"**Commercial :** `{commercial}`")
             st.write(
-                f"**À envoyer maintenant :** {len(to_send)} · **Ignorés doublon :** {len(skipped)} · "
-                f"**Reportés (quota) :** {len(deferred)}"
+                f"**À envoyer :** {len(to_send)} · **Doublons :** {len(skipped)} · **Quota :** {len(deferred)} reporté(s)"
             )
             if skipped:
-                with st.expander("Numéros ignorés (anti-doublon)"):
+                with st.expander("Ignorés (anti-doublon)"):
                     st.code("\n".join(skipped))
             if deferred:
-                with st.expander("Reportés (plafond heure/jour)"):
+                with st.expander("Reportés (plafond)"):
                     st.code("\n".join(deferred))
-                    st.caption("Relance plus tard — les plafonds protègent contre un blocage Google.")
 
             if not to_send:
-                st.success("Rien à envoyer (doublons et/ou quota atteint).")
+                st.success("Rien à envoyer.")
             else:
                 st.session_state.running = True
                 st.session_state.stop_requested = False
-                progress = st.progress(0.0, text="Préparation session…")
+                progress = st.progress(0.0, text="Session…")
                 status = st.empty()
                 log_box = st.empty()
                 run_log: list[str] = []
                 hist = load_history()
                 consec = int(bot_state.get("consec_errors") or 0)
 
-                status.info("Ouverture du formulaire (cookies / session)…")
+                status.info("Ouverture du formulaire…")
                 session = build_session()
-                progress.progress(0.02, text="Session prête")
 
                 for i, client in enumerate(to_send):
                     if st.session_state.stop_requested:
                         run_log.append(f"⏹ Arrêt avant {client}")
                         break
 
-                    status.info(f"Envoi {i + 1}/{len(to_send)} → `{client}` …")
-                    ok, detail, blocked = submit_form(session, commercial, client, today_str)
+                    status.info(f"Envoi {i + 1}/{len(to_send)} → `{client}`")
+                    ok, detail, blocked, edit2, edit_url = submit_form(
+                        session, commercial, client, today_str
+                    )
                     entry = {
+                        "id": f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{client}",
                         "ts": datetime.now().isoformat(timespec="seconds"),
                         "commercial": commercial,
                         "client": client,
@@ -410,6 +463,8 @@ if start:
                         "status": "success" if ok else "error",
                         "detail": detail,
                         "blocked": blocked,
+                        "edit2": edit2,
+                        "edit_url": edit_url,
                     }
                     hist.append(entry)
                     save_history(hist)
@@ -417,14 +472,14 @@ if start:
                     if ok:
                         already.add(client)
                         consec = 0
-                        run_log.append(f"✅ {client} — {detail}")
+                        edit_note = " · lien modifier OK" if edit_url else " · (pas de lien modifier)"
+                        run_log.append(f"✅ {client} — {detail}{edit_note}")
                     else:
                         consec += 1
                         run_log.append(f"❌ {client} — {detail}")
 
                     bot_state["consec_errors"] = consec
                     save_state(bot_state)
-
                     progress.progress((i + 1) / len(to_send), text=f"{i + 1}/{len(to_send)}")
                     log_box.code("\n".join(run_log[-40:]))
 
@@ -433,22 +488,17 @@ if start:
                         until = datetime.now() + timedelta(seconds=pause_sec)
                         bot_state["pause_until"] = until.isoformat(timespec="seconds")
                         save_state(bot_state)
-                        run_log.append(
-                            f"🛡️ Pause sécurité {int(pause_sec)}s (erreurs/blocage). Reprendre après {until.strftime('%H:%M:%S')}."
-                        )
+                        run_log.append(f"🛡️ Pause {int(pause_sec)}s jusqu’à {until.strftime('%H:%M:%S')}")
                         log_box.code("\n".join(run_log[-40:]))
-                        status.error("Pause anti-blocage activée — envois interrompus.")
+                        status.error("Pause anti-blocage.")
                         break
 
                     if i < len(to_send) - 1 and not st.session_state.stop_requested:
-                        wait = random.uniform(float(delay_min), float(delay_max))
-                        # micro-jitter
-                        wait += random.uniform(0.3, 1.7)
-                        status.warning(f"⏳ Prochain envoi dans ~{int(wait)} s…")
+                        wait = random.uniform(float(delay_min), float(delay_max)) + random.uniform(0.3, 1.7)
+                        status.warning(f"⏳ Prochain envoi ~{int(wait)} s")
                         if sleep_interruptible(wait):
                             run_log.append("⏹ Arrêt pendant l’attente")
                             break
-                        # périodiquement rafraîchir la page form (cookies)
                         if (i + 1) % 8 == 0:
                             try:
                                 session.get(FORM_VIEW_URL, timeout=20)
@@ -457,26 +507,140 @@ if start:
                                 pass
 
                 st.session_state.running = False
-                st.session_state.last_run_log = run_log
-                if not st.session_state.stop_requested and consec < MAX_CONSECUTIVE_ERRORS:
-                    status.success("Terminé.")
                 st.session_state.stop_requested = False
+                if consec < MAX_CONSECUTIVE_ERRORS:
+                    status.success("Terminé.")
 
 st.divider()
-st.subheader("Historique local")
+st.subheader("📜 Historique local — travail du bot")
 history = load_history()
-st.caption(f"{len(history)} ligne(s) · `{HISTORY_FILE.name}`")
-if history:
-    ok_n = sum(1 for h in history if h.get("status") == "success")
-    err_n = len(history) - ok_n
-    st.write(
-        f"Succès : **{ok_n}** · Erreurs : **{err_n}** · Clients uniques OK : **{len(successful_client_numbers(history))}**"
-    )
-    st.dataframe(list(reversed(history[-100:])), use_container_width=True)
+st.caption(
+    f"{len(history)} envoi(s) · fichier `{HISTORY_FILE.name}` · "
+    "bouton **Modifier** = même action que « Modifier votre réponse » sur Google"
+)
+
+if not history:
+    st.info("Aucun envoi enregistré.")
 else:
-    st.info("Aucun envoi enregistré pour le moment.")
+    ok_n = sum(1 for h in history if h.get("status") == "success")
+    st.write(
+        f"Succès : **{ok_n}** · Erreurs : **{len(history) - ok_n}** · "
+        f"Avec lien modifier : **{sum(1 for h in history if h.get('edit_url') or h.get('edit2'))}**"
+    )
+
+    # Liste inversée (plus récent en haut)
+    for rev_i, row in enumerate(reversed(history[-80:])):
+        real_index = len(history) - 1 - rev_i
+        with st.container():
+            c1, c2, c3 = st.columns([3, 1, 1])
+            status_icon = "✅" if row.get("status") == "success" else "❌"
+            with c1:
+                st.markdown(
+                    f"{status_icon} **{row.get('client', '—')}** · com. `{row.get('commercial', '—')}`  \n"
+                    f"<span style='color:#888;font-size:0.85rem'>{row.get('ts', '')} · date form {row.get('date', '')}</span>",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if row.get("edit_url"):
+                    st.link_button("Ouvrir Google", row["edit_url"], use_container_width=True)
+                elif row.get("edit2"):
+                    st.link_button(
+                        "Ouvrir Google",
+                        f"{FORM_VIEW_URL}?edit2={row['edit2']}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("Pas de lien")
+            with c3:
+                if row.get("status") == "success" and (row.get("edit2") or row.get("edit_url")):
+                    if st.button("✏️ Modifier", key=f"edit_btn_{real_index}", use_container_width=True):
+                        st.session_state.edit_row_idx = real_index
+                        st.rerun()
+                elif row.get("status") == "success":
+                    st.caption("Édition N/A")
+
+            if st.session_state.edit_row_idx == real_index:
+                st.markdown("---")
+                st.markdown(f"### Modifier la réponse — client `{row.get('client')}`")
+                st.caption("Équivalent de « Modifier votre réponse » sur la page Google Forms.")
+                with st.form(key=f"edit_form_{real_index}"):
+                    new_commercial = st.text_input(
+                        "Numéro commercial",
+                        value=str(row.get("commercial") or ""),
+                    )
+                    new_client = st.text_input(
+                        "Numéro client",
+                        value=str(row.get("client") or ""),
+                    )
+                    new_date = st.text_input(
+                        "Date prospection (AAAA-MM-JJ)",
+                        value=str(row.get("date") or date.today().isoformat()),
+                    )
+                    submitted = st.form_submit_button("Enregistrer la modification sur Google", type="primary")
+                    cancel = st.form_submit_button("Annuler")
+
+                if cancel:
+                    st.session_state.edit_row_idx = None
+                    st.rerun()
+
+                if submitted:
+                    nc = normalize_phone(new_commercial)
+                    ncl = normalize_phone(new_client)
+                    edit2 = row.get("edit2")
+                    if not edit2 and row.get("edit_url"):
+                        qs = parse_qs(urlparse(row["edit_url"]).query)
+                        edit2 = (qs.get("edit2") or [None])[0]
+                    if not nc or not ncl:
+                        st.error("Numéros invalides.")
+                    elif not edit2:
+                        st.error(
+                            "Pas de token edit2 pour cette ligne. "
+                            "Vérifie que le formulaire autorise la modification après envoi, "
+                            "puis refais un envoi test."
+                        )
+                    else:
+                        with st.spinner("Mise à jour Google Forms…"):
+                            session = build_session()
+                            ok, detail, blocked, new_tok, new_url = submit_form(
+                                session, nc, ncl, new_date, edit2=edit2
+                            )
+                        hist = load_history()
+                        if 0 <= real_index < len(hist):
+                            hist[real_index]["commercial"] = nc
+                            hist[real_index]["client"] = ncl
+                            hist[real_index]["date"] = new_date
+                            hist[real_index]["detail"] = f"modifié: {detail}"
+                            hist[real_index]["ts_modified"] = datetime.now().isoformat(timespec="seconds")
+                            if new_tok:
+                                hist[real_index]["edit2"] = new_tok
+                            if new_url:
+                                hist[real_index]["edit_url"] = new_url
+                            # journal
+                            hist.append(
+                                {
+                                    "id": f"edit_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                                    "ts": datetime.now().isoformat(timespec="seconds"),
+                                    "commercial": nc,
+                                    "client": ncl,
+                                    "date": new_date,
+                                    "status": "success" if ok else "error",
+                                    "detail": f"UPDATE via bot: {detail}",
+                                    "edit2": new_tok or edit2,
+                                    "edit_url": new_url or row.get("edit_url"),
+                                    "parent_id": row.get("id"),
+                                }
+                            )
+                            save_history(hist)
+                        if ok:
+                            st.success("Réponse modifiée sur Google Forms.")
+                            st.session_state.edit_row_idx = None
+                            time.sleep(0.8)
+                            st.rerun()
+                        else:
+                            st.error(f"Échec modification : {detail}")
+            st.divider()
 
 st.caption(
-    "Les délais aléatoires et plafonds réduisent le risque de blocage ; "
-    "ils ne garantissent pas l’absence de captcha côté Google."
+    "Si aucun bouton Modifier n’apparaît : dans Google Forms → Paramètres → "
+    "Réponses → active « Autoriser la modification de la réponse après l’envoi »."
 )
