@@ -1,0 +1,5 @@
+historique_envois.json
+__pycache__/
+.venv/
+venv/
+.env
