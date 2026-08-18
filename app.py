@@ -172,10 +172,13 @@ def extract_edit_link(response: requests.Response) -> tuple[str | None, str | No
                 edit_url = f"{FORM_VIEW_URL}?usp=form_confirm&edit2={tok}"
                 return tok, edit_url
 
-    m = re.search(
-        r"https://docs\.google\.com/forms/d/e/" + re.escape(FORM_ID) + r"/viewform\?[^"'\s>]*edit2=([A-Za-z0-9_\-\.]+)",
-        text,
+    # Fallback : URL viewform complète avec edit2
+    pat = (
+        r"https://docs\.google\.com/forms/d/e/"
+        + re.escape(FORM_ID)
+        + r"/viewform\?[^\s\"\'>]*edit2=([A-Za-z0-9_\-\.]+)"
     )
+    m = re.search(pat, text)
     if m:
         tok = m.group(1)
         return tok, f"{FORM_VIEW_URL}?usp=form_confirm&edit2={tok}"
