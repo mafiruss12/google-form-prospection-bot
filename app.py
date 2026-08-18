@@ -157,41 +157,45 @@ def looks_blocked(response: requests.Response) -> bool:
 
 def extract_edit_link(response: requests.Response) -> tuple[str | None, str | None]:
     """
-    Récupère le token edit2 et l’URL « Modifier votre réponse » depuis la page de confirmation.
-    Nécessite que le propriétaire du form ait activé « Modifier après envoi ».
+    Récupère le token edit2 depuis la page « Merci » (lien Edit your response / Modifier).
     """
-    text = response.text or ""
-    final_url = response.url or ""
+    text = (response.text or "").replace("&amp;", "&")
+    final_url = (response.url or "").replace("&amp;", "&")
 
-    # 1) URL de redirection
-    for candidate in (final_url,):
-        if "edit2=" in candidate:
-            qs = parse_qs(urlparse(candidate).query)
-            tok = (qs.get("edit2") or [None])[0]
-            if tok:
-                edit_url = f"{FORM_VIEW_URL}?edit2={tok}"
+    for candidate in (final_url, text):
+        if "edit2=" not in candidate:
+            continue
+        # tous les tokens edit2=
+        found = re.findall(r"edit2=([A-Za-z0-9_\-\.]+)", candidate)
+        for tok in found:
+            if len(tok) >= 10:
+                edit_url = f"{FORM_VIEW_URL}?usp=form_confirm&edit2={tok}"
                 return tok, edit_url
 
-    # 2) Lien href dans le HTML
-    m = EDIT_HREF_RE.search(text)
+    m = re.search(
+        r"https://docs\.google\.com/forms/d/e/" + re.escape(FORM_ID) + r"/viewform\?[^"'\s>]*edit2=([A-Za-z0-9_\-\.]+)",
+        text,
+    )
     if m:
-        href = m.group(1).replace("&amp;", "&")
-        qs = parse_qs(urlparse(href).query)
-        tok = (qs.get("edit2") or [None])[0]
-        if tok:
-            return tok, f"{FORM_VIEW_URL}?edit2={tok}"
-        return None, href
-
-    # 3) Token brut dans la page
-    m2 = EDIT2_RE.search(text)
-    if m2:
-        tok = m2.group(1)
-        return tok, f"{FORM_VIEW_URL}?edit2={tok}"
+        tok = m.group(1)
+        return tok, f"{FORM_VIEW_URL}?usp=form_confirm&edit2={tok}"
 
     return None, None
 
 
-def build_session() -> requests.Session:
+def extract_fbzx(html: str) -> str | None:
+    for pat in [
+        r'name="fbzx"\s+value="([^"]+)"',
+        r'name="fbzx"\s+value=\"([^"]+)\"',
+        r'["\']fbzx["\']\s*[:=]\s*["\']?(-?\d+)',
+    ]:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return None
+
+
+def build_session() -> tuple[requests.Session, str | None]:
     session = requests.Session()
     ua = random.choice(USER_AGENTS)
     session.headers.update(
@@ -209,12 +213,14 @@ def build_session() -> requests.Session:
             "Cache-Control": "max-age=0",
         }
     )
+    fbzx = None
     try:
-        session.get(FORM_VIEW_URL, timeout=30)
-        time.sleep(random.uniform(1.2, 2.8))
+        r = session.get(FORM_VIEW_URL, timeout=30)
+        fbzx = extract_fbzx(r.text or "")
+        time.sleep(random.uniform(1.0, 2.2))
     except requests.RequestException:
         pass
-    return session
+    return session, fbzx
 
 
 def submit_form(
@@ -223,6 +229,7 @@ def submit_form(
     client: str,
     prospection_date: str,
     edit2: str | None = None,
+    fbzx: str | None = None,
 ) -> tuple[bool, str, bool, str | None, str | None]:
     """
     Returns (ok, detail, blocked, edit2_token, edit_url)
@@ -232,7 +239,11 @@ def submit_form(
         ENTRY_COMMERCIAL: commercial,
         ENTRY_DATE: prospection_date,
         ENTRY_CLIENT: client,
+        "fvv": "1",
+        "pageHistory": "0",
     }
+    if fbzx:
+        payload["fbzx"] = fbzx
     if edit2:
         payload["edit2"] = edit2
 
@@ -443,7 +454,7 @@ if start:
                 consec = int(bot_state.get("consec_errors") or 0)
 
                 status.info("Ouverture du formulaire…")
-                session = build_session()
+                session, fbzx = build_session()
 
                 for i, client in enumerate(to_send):
                     if st.session_state.stop_requested:
@@ -452,7 +463,7 @@ if start:
 
                     status.info(f"Envoi {i + 1}/{len(to_send)} → `{client}`")
                     ok, detail, blocked, edit2, edit_url = submit_form(
-                        session, commercial, client, today_str
+                        session, commercial, client, today_str, fbzx=fbzx
                     )
                     entry = {
                         "id": f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{client}",
@@ -499,9 +510,10 @@ if start:
                         if sleep_interruptible(wait):
                             run_log.append("⏹ Arrêt pendant l’attente")
                             break
-                        if (i + 1) % 8 == 0:
+                        if (i + 1) % 5 == 0:
                             try:
-                                session.get(FORM_VIEW_URL, timeout=20)
+                                rr = session.get(FORM_VIEW_URL, timeout=20)
+                                fbzx = extract_fbzx(rr.text or "") or fbzx
                                 time.sleep(random.uniform(0.8, 1.5))
                             except requests.RequestException:
                                 pass
@@ -600,9 +612,9 @@ else:
                         )
                     else:
                         with st.spinner("Mise à jour Google Forms…"):
-                            session = build_session()
+                            session, fbzx = build_session()
                             ok, detail, blocked, new_tok, new_url = submit_form(
-                                session, nc, ncl, new_date, edit2=edit2
+                                session, nc, ncl, new_date, edit2=edit2, fbzx=fbzx
                             )
                         hist = load_history()
                         if 0 <= real_index < len(hist):
