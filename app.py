@@ -381,8 +381,16 @@ with st.form("config_form", clear_on_submit=False):
         height=180,
         placeholder="0701111111\n0702222222",
     )
-    today_str = date.today().isoformat()
-    st.info(f"📅 Date prospection (auto) : **{today_str}**")
+    prospection_date = st.date_input(
+        "📅 Date de prospection",
+        value=date.today(),
+        min_value=date(2020, 1, 1),
+        max_value=date.today() + timedelta(days=365),
+        format="DD/MM/YYYY",
+        help="Date envoyée dans le champ « Date prospection » du Google Form",
+    )
+    today_str = prospection_date.isoformat()
+    st.caption(f"Sera envoyée au formulaire : **{today_str}** (format Google)")
     start = st.form_submit_button("▶ Démarrer les envois", type="primary", use_container_width=True)
 
 col_stop, col_clear = st.columns(2)
@@ -434,6 +442,7 @@ if start:
             to_send = to_send[:quota]
 
             st.write(f"**Commercial :** `{commercial}`")
+            st.write(f"**Date prospection :** `{today_str}`")
             st.write(
                 f"**À envoyer :** {len(to_send)} · **Doublons :** {len(skipped)} · **Quota :** {len(deferred)} reporté(s)"
             )
