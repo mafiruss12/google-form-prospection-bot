@@ -27,12 +27,12 @@ ENTRY_CLIENT = "entry.1166974658"
 HISTORY_FILE = Path(__file__).resolve().parent / "historique_envois.json"
 STATE_FILE = Path(__file__).resolve().parent / "bot_state.json"
 
-DEFAULT_DELAY_MIN = 22
-DEFAULT_DELAY_MAX = 38
+DEFAULT_DELAY_MIN = 2
+DEFAULT_DELAY_MAX = 5
 MAX_PER_HOUR = 40
 MAX_PER_DAY = 200
-MAX_CONSECUTIVE_ERRORS = 3
-BACKOFF_BASE_SEC = 60
+MAX_CONSECUTIVE_ERRORS = 15
+BACKOFF_BASE_SEC = 20
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -342,8 +342,8 @@ bot_state = load_state()
 
 with st.sidebar:
     st.header("🛡️ Sécurité / rythme")
-    delay_min = st.slider("Délai min (s)", 15, 60, DEFAULT_DELAY_MIN)
-    delay_max = st.slider("Délai max (s)", 20, 90, DEFAULT_DELAY_MAX)
+    delay_min = st.slider("Délai min (s)", 2, 60, DEFAULT_DELAY_MIN)
+    delay_max = st.slider("Délai max (s)", 2, 90, DEFAULT_DELAY_MAX)
     if delay_max < delay_min:
         delay_max = delay_min
     max_hour = st.number_input("Max succès / heure", 5, 120, MAX_PER_HOUR)
@@ -506,7 +506,11 @@ if start:
                     progress.progress((i + 1) / len(to_send), text=f"{i + 1}/{len(to_send)}")
                     log_box.code("\n".join(run_log[-40:]))
 
-                    if blocked or consec >= MAX_CONSECUTIVE_ERRORS:
+                    if blocked:
+                        run_log.append(f"⚠️ Signal anti-bot sur {client} — on continue")
+                        log_box.code("\n".join(run_log[-40:]))
+
+                    if consec >= MAX_CONSECUTIVE_ERRORS:
                         pause_sec = BACKOFF_BASE_SEC * (2 ** min(consec, 4)) + random.randint(10, 40)
                         until = datetime.now() + timedelta(seconds=pause_sec)
                         bot_state["pause_until"] = until.isoformat(timespec="seconds")
